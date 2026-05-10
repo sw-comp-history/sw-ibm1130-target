@@ -62,24 +62,40 @@ fn calling_convention_saved_sets() {
         Ibm1130CallConv::caller_saved(),
         &[Reg::Acc, Reg::Ext, Reg::Xr1]
     );
-    assert_eq!(Ibm1130CallConv::callee_saved(), &[Reg::Xr2, Reg::Xr3]);
+    assert_eq!(Ibm1130CallConv::callee_saved(), &[Reg::Xr2]);
 }
 
 #[test]
-fn calling_convention_pointers() {
-    assert_eq!(Ibm1130CallConv::frame_pointer(), Some(Reg::Xr3));
+fn calling_convention_no_separate_frame_pointer() {
+    // XR2 is the frame base AND the logical SP; there is no
+    // separate FP. See docs/abi.md Sec 6.
+    assert_eq!(Ibm1130CallConv::frame_pointer(), None);
     assert_eq!(Ibm1130CallConv::stack_pointer(), Reg::Xr2);
     assert_eq!(Ibm1130CallConv::STACK_ALIGNMENT, 1);
 }
 
 #[test]
-fn caller_and_callee_saved_partition_named_regs() {
-    // ACC, EXT, XR1, XR2, XR3 should each appear in exactly one of
-    // caller_saved or callee_saved (IAR is hardware-managed and is
-    // intentionally absent from both).
+fn xr3_is_never_named_in_calling_convention() {
+    // XR3 is the LIBF transfer-vector base, reserved for the program
+    // lifetime by the loader. It must never appear in arg, return,
+    // caller-saved, callee-saved, or pointer slots.
+    assert!(!Ibm1130CallConv::arg_regs().contains(&Reg::Xr3));
+    assert_ne!(Ibm1130CallConv::return_reg(), Reg::Xr3);
+    assert!(!Ibm1130CallConv::caller_saved().contains(&Reg::Xr3));
+    assert!(!Ibm1130CallConv::callee_saved().contains(&Reg::Xr3));
+    assert_ne!(Ibm1130CallConv::stack_pointer(), Reg::Xr3);
+    assert_ne!(Ibm1130CallConv::frame_pointer(), Some(Reg::Xr3));
+}
+
+#[test]
+fn caller_and_callee_saved_partition_xr1_xr2_acc_ext() {
+    // ACC, EXT, XR1, XR2 must each appear in exactly one of
+    // caller_saved or callee_saved. XR3 and IAR are intentionally
+    // absent from both (XR3 is reserved-for-loader; IAR is hardware-
+    // managed).
     let caller: Vec<Reg> = Ibm1130CallConv::caller_saved().to_vec();
     let callee: Vec<Reg> = Ibm1130CallConv::callee_saved().to_vec();
-    for r in [Reg::Acc, Reg::Ext, Reg::Xr1, Reg::Xr2, Reg::Xr3] {
+    for r in [Reg::Acc, Reg::Ext, Reg::Xr1, Reg::Xr2] {
         let in_caller = caller.contains(&r);
         let in_callee = callee.contains(&r);
         assert!(
@@ -88,6 +104,8 @@ fn caller_and_callee_saved_partition_named_regs() {
             r
         );
     }
+    assert!(!caller.contains(&Reg::Xr3));
+    assert!(!callee.contains(&Reg::Xr3));
     assert!(!caller.contains(&Reg::Iar));
     assert!(!callee.contains(&Reg::Iar));
 }
@@ -98,11 +116,21 @@ fn register_classes_gpr_is_acc_xr1() {
 }
 
 #[test]
-fn register_classes_reserved_blocks_sp_fp_pc_and_ext() {
+fn register_classes_reserved_blocks_libf_base_frame_pc_and_ext() {
+    // EXT, XR2, XR3, IAR all unsafe for individual allocation.
     let reserved = Ibm1130RegClasses::reserved();
     for r in [Reg::Ext, Reg::Xr2, Reg::Xr3, Reg::Iar] {
         assert!(reserved.contains(&r), "{:?} should be reserved", r);
     }
+}
+
+#[test]
+fn xr3_is_reserved_class() {
+    // Defensive: the LIBF transfer-vector base must always be
+    // reserved. A future contributor "freeing up" XR3 would silently
+    // break interop with every IBM library subroutine.
+    assert!(Ibm1130RegClasses::reserved().contains(&Reg::Xr3));
+    assert!(!Ibm1130RegClasses::gpr().contains(&Reg::Xr3));
 }
 
 #[test]

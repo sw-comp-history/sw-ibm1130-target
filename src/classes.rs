@@ -1,10 +1,18 @@
-//! Register classes for the IBM 1130 allocator. See `docs/abi.md` Sec 2.
+//! Register classes for the IBM 1130 allocator. See `docs/abi.md`
+//! Sec 2 for the full role assignment and citations.
 //!
 //! GPR = freely allocatable individual 16-bit registers (ACC, XR1).
-//! Reserved = registers the allocator must not touch (EXT pairs only,
-//! XR2 = SP, XR3 = FP, IAR = PC).
-//! Fixed pairs = register pairs allocated together (ACC+EXT for
-//! 32-bit M / D / LDD / STD / AD / SD).
+//!
+//! Reserved = registers the allocator must not touch:
+//!
+//! - EXT (used only as the low half of the ACC+EXT pair)
+//! - XR2 (frame base; doubles as SP per docs/abi.md Sec 6)
+//! - XR3 (LIBF transfer-vector base; loader-managed program-lifetime
+//!   invariant -- never modified by user code)
+//! - IAR (program counter)
+//!
+//! Fixed pairs = register pairs allocated together: (ACC, EXT) for
+//! 32-bit M / D / LDD / STD / AD / SD.
 
 use sw_ibm1130_isa::{Ibm1130, Reg};
 use sw_target_core::RegisterClasses;

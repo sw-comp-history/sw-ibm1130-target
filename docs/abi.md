@@ -1,20 +1,32 @@
 # IBM 1130 ABI
 
-Status: invented for this toolchain. The IBM 1130 manuals do not specify
-a calling convention -- routine entry/exit was per-program in the era's
-assembly idiom, and the FORTRAN/CALL subroutine library used its own
-conventions tied to IBM's runtime. This document defines the ABI that
-`sw-ibm1130-target`, `sw-ibm1130-codegen`, and downstream code agree
-on.
+Status: this ABI is **anchored on the historical 1130 calling
+conventions** documented in IBM's 1130 Subroutine Library
+(C26-5929-4), the FORTRAN compiler's runtime, and the standard CALL /
+LIBF linkage idioms. The 1130 manuals do not codify a single official
+ABI -- different software ecosystems (FORTRAN, Assembler, Disk
+Monitor System) settled on different conventions on top of the BSI
+instruction -- but the cross-cutting invariants that all of them
+respected are load-bearing for our codegen, and we follow them.
+
+A first-pass invented ABI was committed in saga step 8 and replaced
+by this version after research against bitsavers listings. See
+`gen-isa/docs/abi-linkage.md` for the research notes that drove the
+revision.
+
+ASCII-only by convention.
 
 References:
 
-- `gen-isa/docs/decisions.md` Sec 1 (XR3 reserved as frame pointer).
+- IBM 1130 Subroutine Library, C26-5929-4 (1966); especially pp. v
+  (Introduction), 2 ("ISS Operation"), 6 ("Basic ISS Calling
+  Sequence"), 9 (core-storage map).
+- IBM 1130 FORTRAN Programming Techniques, C20-1642-0.
+- `gen-isa/docs/abi-linkage.md` for the research synthesis.
+- `gen-isa/docs/decisions.md` Sec 1 (saga directional decisions).
 - `gen-isa/docs/porting-guide.md` Sec 5 (ABI invention guidance).
-- IBM 1130 Functional Characteristics (GA26-5881) for hardware register
-  state and instruction semantics.
-
-ASCII-only by convention.
+- IBM 1130 Functional Characteristics (GA26-5881) for hardware
+  register state and instruction semantics.
 
 ## 1. Machine state recap
 
@@ -31,55 +43,73 @@ view (see `sw-ibm1130-isa::register::Reg`):
 | IAR  | 16    | instruction address register (program counter) |
 
 There is no hardware stack pointer, no hardware push/pop, no link
-register. Subroutine calls use BSI (Branch and Store IAR), which writes
-the return address into the word at the call target and jumps to
-target+1; this makes the simplest recursion-free call shape natural,
-and forces software to manage any stack discipline.
+register. Subroutine calls use BSI (Branch and Store IAR), which
+writes the return address into the word at the call target and jumps
+to target+1. Every linkage idiom on the 1130 (CALL, LIBF, ISS) is a
+shape on top of BSI.
 
 Memory is word-addressed: 1 address-unit = 1 16-bit word = 2 bytes.
 Word alignment is the only alignment that exists.
 
 ## 2. Register roles (this ABI)
 
-| Reg  | Role                                       | Saved by  |
-| ---- | ------------------------------------------ | --------- |
-| ACC  | first scalar arg; scalar return value      | caller    |
-| EXT  | high half of 32-bit return; ACC+EXT pair   | caller    |
-| XR1  | scratch index / second arg slot pointer    | caller    |
-| XR2  | logical stack pointer                      | callee    |
-| XR3  | frame pointer                              | callee    |
-| IAR  | program counter                            | hardware  |
+| Reg  | Role                                            | Saved by  |
+| ---- | ----------------------------------------------- | --------- |
+| ACC  | first scalar arg; scalar return value           | caller    |
+| EXT  | high half of 32-bit return; ACC+EXT pair        | caller    |
+| XR1  | scratch + parameter-list pointer in callee      | caller    |
+| XR2  | frame base (locals + spills); doubles as SP     | callee    |
+| XR3  | **LIBF transfer-vector base -- never modified** | loader    |
+| IAR  | program counter                                 | hardware  |
 
 "caller" = caller must save before the call if it needs the value
-afterward. "callee" = callee must save on entry and restore on exit if
-it modifies the register.
+afterward. "callee" = callee must save on entry and restore on exit
+if it modifies the register.
+
+**XR3 is reserved.** This is non-negotiable: standard 1130 software
+addresses every library subprogram (LIBF) through XR3, and any code
+that wants to interoperate with FORTRAN, the Disk Monitor System
+I/O subroutines, or any IBM-supplied library must leave XR3 alone for
+the program's entire lifetime. The loader sets XR3 to the transfer-
+vector base; user code (including ours) must never write it.
 
 The general-purpose register class for the allocator is `{ACC, XR1}`.
 EXT is reserved for individual allocation (only used as the low half
-of the ACC+EXT pair); XR2 and XR3 are reserved for SP and FP.
+of the ACC+EXT pair); XR2 is reserved as the frame base; XR3 is
+reserved for the LIBF base.
 
 ## 3. Argument passing
+
+Following the standard CALL idiom (see Subroutine Library p. v and
+ibm1130.net's "Programming Tips and Techniques"):
 
 - The first scalar argument (16-bit or smaller) is passed in **ACC**.
 - The first 32-bit argument is passed in the **ACC+EXT** pair (ACC =
   high word, EXT = low word).
-- Subsequent arguments are passed in memory at fixed slots adjacent to
-  the call site. Concretely: the caller emits the additional arg words
-  immediately after the BSI long-form word, and the callee reads them
-  by indexing through XR1 set to the return address minus one.
-- Arguments larger than 32 bits (I64/U64) are passed entirely in
-  memory, by value, in the same call-site arg block.
-- Pointers are 1 word (16 bits) and pass like any other 16-bit scalar:
-  ACC for the first slot, then the in-memory arg block.
+- Subsequent arguments are passed **in-line after the BSI** as DC
+  words. Each DC holds either an immediate value (for scalars whose
+  address is the constant itself) or the address of the actual
+  argument (for by-reference passing, FORTRAN style).
+- Arguments larger than 32 bits (I64/U64, structs, arrays) are
+  passed by reference: the caller emits a DC with the argument's
+  address; the callee reads through it.
+- Pointers are 1 word (16 bits) and pass like any other 16-bit
+  scalar: ACC for the first slot, then in-line DC words.
 
-The "args after the BSI" arrangement matches the historical 1130
-subroutine library shape (the standard "load XR1 from IAR, then read
-arg cells via STX/LDX off XR1") and avoids needing dynamic stack
-discipline for non-recursive code.
+The callee reads its in-line arguments by indexing through the return-
+address slot. After the BSI, the entry word at NAME holds the return
+address (which is also the address of the first DC). On return, the
+callee bumps the return address past the parameter block; control
+flows to the instruction after the last DC.
 
 Variadic functions are **not supported** in this ABI. A future
 extension could add an explicit args-area pointer; it is out of scope
 for the bring-up.
+
+LIBF linkage (one-word call through an XR3-relative transfer vector)
+is **not emitted by our codegen** in the bring-up scope. LIBF would
+require building a transfer-vector pass at link time. The CALL idiom
+above is self-contained and is what step-9 codegen exercises.
 
 ## 4. Return value
 
@@ -87,121 +117,137 @@ for the bring-up.
 - 32-bit scalars (I32, U32): in the **ACC+EXT** pair (ACC = high, EXT
   = low). This is the natural shape for `M` and `D` results.
 - 64-bit scalars (I64, U64): returned in memory at a caller-provided
-  hidden first argument; the address goes in XR1 and the callee writes
-  four words there.
+  hidden first argument; the address goes in XR1 and the callee
+  writes four words there.
 - Aggregates and structs: same as I64 -- caller-provided hidden
   pointer in XR1; callee writes by indexing.
 
 ## 5. Caller-saved vs callee-saved
 
 Caller-saved (volatile across calls): **ACC, EXT, XR1**.
-Callee-saved (preserved across calls): **XR2, XR3**.
-IAR is hardware-managed (BSI writes it, branches modify it).
+Callee-saved (preserved across calls): **XR2**.
+Reserved (program-lifetime invariant): **XR3** (LIBF base).
+Hardware-managed: **IAR** (BSI writes it; branches modify it).
 
 Rationale:
 
-- ACC and EXT are the only arithmetic registers; making them
-  callee-saved would force every leaf function to save/restore them,
-  which is wasteful when most calls happen mid-expression.
-- XR1 is the codegen scratch pointer -- caller-saved so callees can
-  trash it freely.
-- XR2 (SP) and XR3 (FP) hold the activation record state and must
-  survive a call.
+- ACC and EXT are the only arithmetic registers; making them callee-
+  saved would force every leaf function to save/restore them, which
+  is wasteful when most calls happen mid-expression. This matches
+  the historical IBM convention -- all ISSs save and restore ACC/EXT
+  internally precisely because callers cannot rely on them.
+- XR1 is the codegen scratch and the conventional FORTRAN parameter
+  pointer; making it caller-saved matches FORTRAN practice and lets
+  callees use it freely.
+- XR2 is callee-saved because it holds the activation record's frame
+  base; it must survive a call.
+- XR3 is the LIBF transfer-vector base -- preserved by the loader for
+  the program's lifetime, never modified by user code.
 
-## 6. Stack
+## 6. Stack and frame base
 
-The 1130 has no hardware stack pointer. This ABI defines a **logical
-stack**:
+The 1130 has no hardware stack pointer. **This ABI does not define a
+separate stack pointer**: activation records are fixed-size at compile
+time, and the same register (XR2) serves as both the frame base and
+the logical stack pointer.
 
-- **Stack pointer**: held in **XR2**. On routine entry, XR2 points to
-  the current activation record's top (lowest address used). The
-  callee may decrement XR2 (subtract from the index register) to
-  allocate locals, and restores XR2 on exit.
-- **Growth direction**: **down** (toward lower addresses), matching
-  most modern conventions and making "decrement to allocate" natural.
-- **Alignment**: **1 word** (1 address-unit). The 1130 cannot address
-  sub-word values, so word alignment is the only alignment.
-- **Initial SP**: program startup loads XR2 with a word in low memory
-  (TBD: codegen + emulator agree on a fixed location, e.g. word
-  address 0x4000) and grows downward from there.
+- **Frame base / stack pointer**: held in **XR2**. On routine entry,
+  XR2 points to the current activation record's base. The callee may
+  decrement XR2 to allocate locals (in functions large enough to need
+  it) and restores XR2 on exit. For most functions, a fixed-size
+  pre-allocated frame in static memory is enough and XR2 is not
+  touched at all.
+- **Growth direction**: **down** (toward lower addresses). This
+  matches modern conventions and makes "decrement to allocate"
+  natural; the 1130's historical FORTRAN runtime did not need any
+  growth direction because frames were static.
+- **Alignment**: **1 word** (1 address-unit). The 1130 cannot
+  address sub-word values, so word alignment is the only alignment.
+- **Recursion**: not in initial scope. The fixed-frame model rules
+  out recursion; supporting it would require a real stack discipline
+  (decrement XR2 on entry, restore on exit) and is left for a future
+  step.
 
-For non-recursive code (the common 1130 case), the SP discipline is
-optional -- a routine may use fixed memory cells for locals without
-touching XR2 at all. The codegen will emit the SP-touching prologue
-only when the function is recursive or has large stack-allocated
-objects.
+The trait `CallingConvention` requires both `stack_pointer` and
+`frame_pointer`. We return XR2 for `stack_pointer` and `None` for
+`frame_pointer`: there is no distinct FP; XR2 is the single frame
+base. This keeps the trait honest -- codegen cannot accidentally use
+a different register for SP vs FP because the ABI says they
+coincide.
 
 ## 7. Frame layout
 
-Stack grows toward lower addresses. The frame pointer (XR3) is set on
-entry and points just below the saved-XR3 slot, so locals and spills
-are addressed via positive offsets and incoming args via negative
-offsets relative to FP.
+Each activation record is laid out at fixed offsets relative to XR2.
+For a function with no nested calls, the frame may live entirely in
+static memory addressable by the assembler-supplied symbol; only
+recursion-capable or large-frame functions actually adjust XR2.
 
 ```
 high addresses
-+------------------+
-| caller args N..  |  passed in memory by caller (above FP)
-+------------------+
-| caller args 1..N |
-+------------------+   <- FP+1 (caller frame top)
-| saved FP (XR3)   |
-+------------------+   <- FP (XR3 = address of this slot's address)
-| saved XR2 (SP)   |   (only if the callee modifies SP)
-+------------------+
-| saved callee     |   (other callee-saved values, currently none)
-| state            |
-+------------------+
-| local var 1      |
-| local var 2      |
-| ...              |
-+------------------+
-| spill slot 1     |
-| spill slot 2     |
-| ...              |
-+------------------+
-| outgoing args    |   (for nested calls; written before BSI)
-+------------------+   <- SP (XR2)
++-------------------------+
+| caller-supplied         |  inline DC parameters following the
+| in-line parameters      |  caller's BSI; addressed via the
+|                         |  return-address slot at NAME
++-------------------------+
+| local var 1             |
+| local var 2             |
+| ...                     |
++-------------------------+
+| spill slot 1            |
+| spill slot 2            |
+| ...                     |
++-------------------------+
+| outgoing-arg scratch    |  for nested calls; addresses written
+|                         |  before BSI, read by the callee
++-------------------------+   <- XR2 (frame base / SP)
 low addresses
 ```
 
 Frame slots are word-addressed; the prologue computes the frame size
-in words at compile time and decrements XR2 by that much.
+in words at compile time and (for stack-using functions) decrements
+XR2 by that much.
 
 ## 8. Prologue / epilogue sketch
 
-Prologue (recursive or stack-using function):
+Most generated functions need no prologue or epilogue: the activation
+record is a static memory block, parameters arrive through in-line
+DCs, and the function body operates directly on those slots.
+
+For functions large enough to need a stack-style frame (or, in a
+future revision, recursion):
+
+Prologue:
 
 ```
-    STX  XR3, FP_save_slot       ; save caller's FP
-    LDX  XR3, XR2                ; FP <- current SP
-    SUB  XR2, frame_size         ; allocate frame
-    ; (no callee-saves besides FP for current spec)
+    STX  2 SAVE_XR2          ; save caller's frame base
+    SUB  XR2, frame_size     ; allocate frame (descending stack)
 ```
 
 Epilogue:
 
 ```
-    LDX  XR2, XR3                ; SP <- FP
-    LDX  XR3, FP_save_slot       ; restore caller's FP
-    BSC  ...                     ; return (BSC with appropriate condition)
+    LDX  2 SAVE_XR2          ; restore caller's frame base
+    BSC  I NAME              ; return: indirect through entry word
 ```
 
-For non-recursive leaf functions, both prologue and epilogue collapse
-to nothing; the function body uses fixed memory cells for locals.
+The return is the standard 1130 idiom: `BSC I NAME` reads the return-
+address word that BSI wrote into NAME, adjusts it past the parameter
+block (callee-known constant), and jumps. Codegen knows the parameter
+count from the call signature.
 
 ## 9. System call interface
 
 Deferred. A real 1130 system call would be a BSI to a stub at a
 well-known address belonging to the System Director (the 1130's
-operating system). Real BSI-to-SIB (System Indicator Block) is **out
+operating system) or a LIBF call into a Disk Monitor I/O subroutine.
+Real BSI-to-SIB (System Indicator Block) and LIBF emission are **out
 of scope** for this bring-up; codegen treats system calls as opaque
 external symbols resolved by the linker / loader.
 
 ## 10. Type widths and alignment
 
-All sizes are in **address-units** (1 word = 16 bits). Pointer width
-is 16 bits.
+All sizes are in **address-units** (1 word = 16 bits = 2 bytes).
+Pointer width is 16 bits.
 
 | Type | Width (words) | Alignment (words) | Storage notes              |
 | ---- | ------------- | ----------------- | -------------------------- |
@@ -224,12 +270,18 @@ responsible for masking on signed/unsigned narrowing.
 These are deliberately deferred and listed here for the postmortem
 step (saga step 12) to revisit:
 
-- The "args after BSI" arg-passing scheme conflates arg layout with
-  call-site code emission; it may force codegen to know the arg list
-  during BSI emission. If this becomes painful, a stack-based arg
-  ABI is a fallback.
-- `M` and `D` produce ACC+EXT results; if the codegen ever wants to
-  use ACC alone after a multiply that the higher half is needed for,
-  the fixed-pair allocator may need to spill EXT explicitly.
-- The exact initial SP value (a memory-map question, not strictly
-  ABI) is TBD until the emulator step (step 11).
+- **LIBF emission.** If the toolchain ever needs to call IBM library
+  subprograms or interoperate with FORTRAN object code, codegen
+  needs to emit LIBF call sequences and a linker pass needs to build
+  the XR3-based transfer vector. Out of scope for the bring-up.
+- **Recursion / dynamic frames.** The fixed-frame model precludes
+  recursion. Adding it would mean decrementing XR2 on entry and
+  restoring on exit; the trait surface already permits it, but
+  codegen does not yet emit those sequences.
+- **`M` / `D` partial-pair use.** Multiply produces ACC+EXT; if
+  codegen ever wants ACC alone after a multiply that needed the
+  high half, the fixed-pair allocator may need to spill EXT
+  explicitly. Has not yet bitten in practice.
+- **Initial XR2 value.** The frame-base register must be initialised
+  by program startup; the exact memory location is a memory-map
+  question (TBD) that the emulator step (step 11) will pin down.
